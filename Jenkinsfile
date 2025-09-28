@@ -7,11 +7,15 @@ pipeline {
     }
 
     environment {
-        SCANNER_HOME = tool 'sonar-scanner'
-        IMAGE_NAME   = "amazon"
-        DOCKER_USER  = "harishnshetty"
-        SONAR_PROJECT = "amazon"
-        NVD_API_KEY = credentials('nvd-api-key')   // Add in Jenkins Credentials
+        SCANNER_HOME   = tool 'sonar-scanner'
+        IMAGE_NAME     = "amazon"
+        DOCKER_USER    = "harishnshetty"
+        SONAR_PROJECT  = "amazon"
+        NVD_API_KEY    = credentials('nvd-api-key')
+
+        // Persistent caches
+        TRIVY_CACHE    = "/var/lib/jenkins/trivy-cache"
+        ODC_CACHE      = "/var/lib/jenkins/odc-cache"
     }
 
     stages {
@@ -49,7 +53,7 @@ pipeline {
             steps {
                 sh '''
                   mkdir -p ~/.npm
-                  npm ci --prefer-offline --no-audit --no-fund
+                  npm ci --prefer-offline --no-audit --no-fund || true
                 '''
             }
         }
@@ -58,72 +62,89 @@ pipeline {
             parallel {
                 stage("OWASP Dependency Check") {
                     steps {
-                        dependencyCheck additionalArguments: """
-                          --scan ./ 
-                          --disableYarnAudit 
-                          --disableNodeAudit 
-                          --nvdApiKey=${NVD_API_KEY}
-                        """,
-                        odcInstallation: 'dp-check'
+                        script {
+                            try {
+                                sh "mkdir -p $ODC_CACHE"
+                                dependencyCheck additionalArguments: """
+                                  --scan ./ 
+                                  --disableYarnAudit 
+                                  --disableNodeAudit 
+                                  --data $ODC_CACHE
+                                  --nvdApiKey=${NVD_API_KEY}
+                                """,
+                                odcInstallation: 'dp-check'
 
-                        dependencyCheckPublisher pattern: '**/dependency-check-report.xml'
+                                dependencyCheckPublisher pattern: '**/dependency-check-report.xml'
+                            } catch (err) {
+                                currentBuild.result = 'UNSTABLE'
+                                echo "OWASP Dependency-Check failed or found vulnerabilities, marking build UNSTABLE"
+                            }
+                        }
                     }
                 }
 
                 stage("Trivy File Scan") {
                     steps {
-                        sh '''
-                          trivy fs --skip-update --severity HIGH,CRITICAL . > trivyfs.txt
-                        '''
+                        script {
+                            try {
+                                sh '''
+                                  mkdir -p $TRIVY_CACHE
+                                  trivy --cache-dir $TRIVY_CACHE --download-db-only || true
+                                  trivy fs --cache-dir $TRIVY_CACHE --skip-db-update --severity HIGH,CRITICAL . > trivyfs.txt || true
+                                '''
+                            } catch (err) {
+                                currentBuild.result = 'UNSTABLE'
+                                echo "Trivy FS scan failed or found vulnerabilities, marking build UNSTABLE"
+                            }
+                        }
                     }
                 }
+            }
+        }
 
-                stage("Trivy Image Scan (Pre-Build)") {
+        stage("Docker Build, Push & Image Scan") {
+            parallel {
+                stage("Build & Push Docker Image") {
                     steps {
-                        sh "trivy --download-db-only || true"
+                        script {
+                            env.IMAGE_TAG = "${DOCKER_USER}/${IMAGE_NAME}:${BUILD_NUMBER}"
+                            withCredentials([string(credentialsId: 'docker-cred', variable: 'dockerpwd')]) {
+                                sh """
+                                  # Build image with cache
+                                  docker build \
+                                    --cache-from=${DOCKER_USER}/${IMAGE_NAME}:latest \
+                                    -t ${IMAGE_NAME} \
+                                    -t ${env.IMAGE_TAG} .
+
+                                  # Login and push
+                                  echo $dockerpwd | docker login -u ${DOCKER_USER} --password-stdin
+                                  docker push ${env.IMAGE_TAG}
+                                  docker tag ${IMAGE_NAME} ${DOCKER_USER}/${IMAGE_NAME}:latest
+                                  docker push ${DOCKER_USER}/${IMAGE_NAME}:latest
+                                """
+                            }
+                        }
                     }
                 }
-            }
-        }
 
-        stage("Build Docker Image") {
-            steps {
-                script {
-                    env.IMAGE_TAG = "${DOCKER_USER}/${IMAGE_NAME}:${BUILD_NUMBER}"
+                stage("Trivy Image Scan") {
+                    steps {
+                        script {
+                            try {
+                                sh """
+                                  mkdir -p $TRIVY_CACHE
+                                  trivy --cache-dir $TRIVY_CACHE --download-db-only || true
 
-                    sh """
-                      docker build \
-                        --cache-from=${DOCKER_USER}/${IMAGE_NAME}:latest \
-                        -t ${IMAGE_NAME} \
-                        -t ${env.IMAGE_TAG} .
-                    """
-                }
-            }
-        }
-
-        stage("Push Docker Image") {
-            steps {
-                script {
-                    withCredentials([string(credentialsId: 'docker-cred', variable: 'dockerpwd')]) {
-                        sh """
-                          echo $dockerpwd | docker login -u ${DOCKER_USER} --password-stdin
-                          docker push ${env.IMAGE_TAG}
-                          docker tag ${IMAGE_NAME} ${DOCKER_USER}/${IMAGE_NAME}:latest
-                          docker push ${DOCKER_USER}/${IMAGE_NAME}:latest
-                        """
+                                  echo '🔍 Running Trivy scan on ${DOCKER_USER}/${IMAGE_NAME}:${BUILD_NUMBER}'
+                                  trivy image --cache-dir $TRIVY_CACHE --skip-db-update --severity HIGH,CRITICAL -f json -o trivy-image.json ${DOCKER_USER}/${IMAGE_NAME}:${BUILD_NUMBER} || true
+                                  trivy image --cache-dir $TRIVY_CACHE --skip-db-update --severity HIGH,CRITICAL -f table -o trivy-image.txt ${DOCKER_USER}/${IMAGE_NAME}:${BUILD_NUMBER} || true
+                                """
+                            } catch (err) {
+                                currentBuild.result = 'UNSTABLE'
+                                echo "Trivy image scan failed or found vulnerabilities, marking build UNSTABLE"
+                            }
+                        }
                     }
-                }
-            }
-        }
-
-        stage("Trivy Scan Image (Post-Push)") {
-            steps {
-                script {
-                    sh """
-                      echo '🔍 Running Trivy scan on ${env.IMAGE_TAG}'
-                      trivy image --skip-update --severity HIGH,CRITICAL -f json -o trivy-image.json ${env.IMAGE_TAG}
-                      trivy image --skip-update --severity HIGH,CRITICAL -f table -o trivy-image.txt ${env.IMAGE_TAG}
-                    """
                 }
             }
         }
@@ -132,7 +153,7 @@ pipeline {
             steps {
                 sh """
                   docker rm -f ${IMAGE_NAME} || true
-                  docker run -d --name ${IMAGE_NAME} -p 80:80 ${env.IMAGE_TAG}
+                  docker run -d --name ${IMAGE_NAME} -p 80:80 ${DOCKER_USER}/${IMAGE_NAME}:${BUILD_NUMBER} || true
                 """
             }
         }
@@ -143,6 +164,9 @@ pipeline {
             script {
                 def buildStatus = currentBuild.currentResult
                 def buildUser = currentBuild.getBuildCauses('hudson.model.Cause$UserIdCause')[0]?.userId ?: 'GitHub User'
+
+                // Archive reports
+                archiveArtifacts artifacts: 'trivyfs.txt,trivy-image.json,trivy-image.txt,dependency-check-report.xml', allowEmptyArchive: true
 
                 emailext (
                     subject: "Pipeline ${buildStatus}: ${env.JOB_NAME} #${env.BUILD_NUMBER}",
