@@ -9,7 +9,7 @@ pipeline {
     environment {
         SCANNER_HOME   = tool 'sonar-scanner'
         IMAGE_NAME     = "amazon"
-        DOCKER_USER    = "harishnshetty"
+        DOCKER_USER    = "kishorpatil2107"
         SONAR_PROJECT  = "amazon"
         NVD_API_KEY    = credentials('nvd-api-key')
 
@@ -108,18 +108,27 @@ pipeline {
                     steps {
                         script {
                             env.IMAGE_TAG = "${DOCKER_USER}/${IMAGE_NAME}:${BUILD_NUMBER}"
+
                             withCredentials([string(credentialsId: 'docker-cred', variable: 'dockerpwd')]) {
                                 sh """
-                                  # Build image with cache
-                                  docker build \
-                                    --cache-from=${DOCKER_USER}/${IMAGE_NAME}:latest \
-                                    -t ${IMAGE_NAME} \
-                                    -t ${env.IMAGE_TAG} .
+                                  # Enable BuildKit for faster build
+                                  export DOCKER_BUILDKIT=1
 
-                                  # Login and push
-                                  echo $dockerpwd | docker login -u ${DOCKER_USER} --password-stdin
-                                  docker push ${env.IMAGE_TAG}
+                                  # Pre-pull base images
+                                  docker pull node:16 || true
+                                  docker pull openjdk:17 || true
+
+                                  # Build Docker image with cache
+                                  docker build --cache-from=${DOCKER_USER}/${IMAGE_NAME}:latest \
+                                    -t ${IMAGE_NAME} \
+                                    -t ${IMAGE_TAG} .
+
+                                  # Login to DockerHub
+                                  echo ${dockerpwd} | docker login -u ${DOCKER_USER} --password-stdin
+
+                                  # Tag and push efficiently
                                   docker tag ${IMAGE_NAME} ${DOCKER_USER}/${IMAGE_NAME}:latest
+                                  docker push ${IMAGE_TAG}
                                   docker push ${DOCKER_USER}/${IMAGE_NAME}:latest
                                 """
                             }
